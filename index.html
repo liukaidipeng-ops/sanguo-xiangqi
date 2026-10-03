@@ -134,6 +134,11 @@ button:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px
 .trail { fill: none; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; }
 .threat { fill: none; stroke: var(--danger); stroke-width: 3; stroke-dasharray: 9 7; stroke-linecap: round; opacity: .85; pointer-events: none; }
 .ghost { pointer-events: none; }
+/* 选子后的走法指引：浅色传送带 + 流动的箭头 */
+.guide { pointer-events: none; }
+.belt { fill: none; stroke: var(--piece); stroke-width: 15; stroke-linecap: round; stroke-linejoin: round; opacity: .5; }
+.chev { fill: none; stroke: var(--target); stroke-width: 2.6; stroke-linecap: round; stroke-linejoin: round; }
+.ahead { fill: var(--target); opacity: .8; }
 .ghost.moving { filter: drop-shadow(0 6px 5px rgba(0, 0, 0, .35)); }
 .burst { fill: none; stroke: var(--danger); stroke-width: 4; pointer-events: none; }
 .nation .tray { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 3px; align-items: center; font-size: 12px; color: var(--muted); }
@@ -519,6 +524,7 @@ var SG = (function () {
     return t;
   });
   var trailLayer = el('g', {}, rot);
+  var guideLayer = el('g', { class: 'guide' }, rot);   // 在棋子下面，经过的棋子会盖住传送带
   var marks = el('g', {}, rot);
   var slots = [];
   for (i = 0; i < 135; i++) {
@@ -546,6 +552,7 @@ var SG = (function () {
   // 动画：pendingAnim 等下一次重画时开始播放；animQ 是排队依次播放的走法（回看、联机补帧）
   var pendingAnim = null, animActive = false, animBusyUntil = 0, animHide = -1, animRaf = 0, animQ = [], qTimer = 0, replaying = false;
   var reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var guideKey = '', guideBelts = [], guideRaf = 0;
   function inputBusy() { return animQ.length > 0 || replaying; }
   function committedMoves() { return moves.concat(animQ); }
 
@@ -726,6 +733,7 @@ var SG = (function () {
     marks.textContent = '';
     // 这一轮三家各自的走法轨迹：用走棋一方的颜色，越早的越淡
     trailLayer.textContent = '';
+    trailLayer.style.opacity = sel >= 0 ? .3 : '';
     var nTrail = Math.min(log.length, 3);
     for (var q = nTrail - 1; q >= 0; q--) {
       var en = log[log.length - 1 - q];
@@ -754,9 +762,12 @@ var SG = (function () {
     if (lastMv && log.length) el('circle', { class: 'last', cx: XY[lastMv[1]][0], cy: XY[lastMv[1]][1], r: 25, style: 'stroke:' + COLORS[log[log.length - 1].mover] }, marks);
     Object.keys(danger).forEach(function (i) { el('circle', { class: 'danger', cx: XY[i][0], cy: XY[i][1], r: 28 }, marks); });
     if (sel >= 0) el('circle', { class: 'sel', cx: XY[sel][0], cy: XY[sel][1], r: 25 }, marks);
+    var ends = drawGuide();
     targets.forEach(function (m) {
-      if (m.cap) el('circle', { class: 'capring', cx: XY[m.to][0], cy: XY[m.to][1], r: 24 }, marks);
-      else el('circle', { class: 'dot', cx: XY[m.to][0], cy: XY[m.to][1], r: 7 }, marks);
+      if (m.cap) {
+        el('circle', { class: 'capring', cx: XY[m.to][0], cy: XY[m.to][1], r: 24 }, marks);
+        if (ends[m.to] && ends[m.to].len > 53) arrowHead(ends[m.to], ends[m.to].len - 31, marks);   // 吃子：箭头顶到圈上（贴身吃子只画圈）
+      } else if (!ends[m.to]) el('circle', { class: 'dot', cx: XY[m.to][0], cy: XY[m.to][1], r: 7 }, marks);
     });
     rot.appendChild(marks); // 标记盖在棋子上方，但不拦截点击
     rot.appendChild(animLayer);
@@ -848,6 +859,66 @@ var SG = (function () {
   function fmt(x) { return (Math.round(x * 10) / 10).toString(); }
 
   // ---------- 走子动画 ----------
+  // ---------- 走法指引：选中棋子后，每个可走方向一条流动的箭头带 ----------
+  // 车、炮、帅沿实际路线（可能在中原拐弯），同一方向只画最远的一条；马、象、仕、兵直接连起点和落点
+  function beltOf(path) {
+    var pts = path.map(function (i) { return XY[i]; }), cum = [0];
+    for (var k = 1; k < pts.length; k++) cum.push(cum[k - 1] + Math.hypot(pts[k][0] - pts[k - 1][0], pts[k][1] - pts[k - 1][1]));
+    return { pts: pts, cum: cum, len: cum[cum.length - 1], chevs: [] };
+  }
+  function alongBelt(b, d) {
+    var k = 1; while (k < b.cum.length - 1 && b.cum[k] < d) k++;
+    var a = b.pts[k - 1], c = b.pts[k], u = (d - b.cum[k - 1]) / ((b.cum[k] - b.cum[k - 1]) || 1);
+    return [a[0] + (c[0] - a[0]) * u, a[1] + (c[1] - a[1]) * u, Math.atan2(c[1] - a[1], c[0] - a[0]) * 180 / Math.PI];
+  }
+  function arrowHead(b, d, parent) {
+    var q = alongBelt(b, d);
+    return el('path', { class: 'ahead', d: 'M9,0 L-7,-8 L-3,0 L-7,8 Z', transform: 'translate(' + q[0].toFixed(1) + ' ' + q[1].toFixed(1) + ') rotate(' + q[2].toFixed(1) + ')' }, parent);
+  }
+  var CHEV_GAP = 22, CHEV_SPEED = 34;
+  function drawGuide() {
+    var key = sel >= 0 ? sel + ':' + targets.map(function (m) { return m.to; }).join(',') : '';
+    var ends = {};
+    if (key !== guideKey) {
+      guideKey = key; guideLayer.textContent = ''; guideBelts = [];
+      cancelAnimationFrame(guideRaf); guideRaf = 0;
+      if (sel >= 0 && targets.length) {
+        var ptype = game.type[sel];
+        var paths = targets.map(function (m) { return movePath(sel, m.to, ptype); });
+        var isPrefix = function (a, b) { if (a.length >= b.length) return false; for (var k = 0; k < a.length; k++) if (a[k] !== b[k]) return false; return true; };
+        paths.forEach(function (pa, n) {
+          if (paths.some(function (pb) { return isPrefix(pa, pb); })) return;   // 被更长的同向路线覆盖
+          var b = beltOf(pa); b.to = targets[n].to; b.cap = targets[n].cap;
+          el('polyline', { class: 'belt', points: poly(b.pts) }, guideLayer);
+          guideBelts.push(b);
+        });
+        guideBelts.forEach(function (b) {
+          for (var k = 0; k <= Math.ceil(b.len / CHEV_GAP); k++) b.chevs.push(el('path', { class: 'chev', d: 'M-4,-5.5 L2.5,0 L-4,5.5' }, guideLayer));
+          if (!b.cap) arrowHead(b, b.len, guideLayer);
+        });
+        moveChevrons(performance.now());
+      }
+    }
+    guideBelts.forEach(function (b) { ends[b.to] = b; });
+    return ends;
+  }
+  function moveChevrons(now) {
+    var off = reduceMotion ? CHEV_GAP / 2 : (now / 1000 * CHEV_SPEED) % CHEV_GAP;
+    guideBelts.forEach(function (b) {
+      var stop = b.len - (b.cap ? 30 : 12);
+      b.chevs.forEach(function (c, k) {
+        var d = k * CHEV_GAP + off;
+        var o = Math.max(0, Math.min(1, (d - 18) / 12, (stop - d) / 12));
+        if (o <= 0) { c.style.display = 'none'; return; }
+        var q = alongBelt(b, d);
+        c.style.display = '';
+        c.setAttribute('opacity', o.toFixed(2));
+        c.setAttribute('transform', 'translate(' + q[0].toFixed(1) + ' ' + q[1].toFixed(1) + ') rotate(' + q[2].toFixed(1) + ')');
+      });
+    });
+    if (!reduceMotion && guideBelts.length) guideRaf = requestAnimationFrame(moveChevrons);
+  }
+
   function makeGhost(at, glyph, owner, isKing) {
     var g = el('g', { class: 'ghost' }, animLayer);
     if (at != null) g.setAttribute('transform', 'translate(' + XY[at][0] + ' ' + XY[at][1] + ')');
@@ -1238,5 +1309,3 @@ var SG = (function () {
   else start(window.claude && window.claude.hot && window.claude.hot.data || {});
 })();
 </script>
-
-</html>
