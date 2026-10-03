@@ -131,6 +131,14 @@ button:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px
 .hint.err { color: var(--danger); }
 .roomcode { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .roomcode b { font-family: var(--serif); font-size: 26px; letter-spacing: .18em; font-variant-numeric: tabular-nums; }
+.trail { fill: none; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; }
+.threat { fill: none; stroke: var(--danger); stroke-width: 3; stroke-dasharray: 9 7; stroke-linecap: round; opacity: .85; pointer-events: none; }
+.ghost { pointer-events: none; }
+.ghost.moving { filter: drop-shadow(0 6px 5px rgba(0, 0, 0, .35)); }
+.burst { fill: none; stroke: var(--danger); stroke-width: 4; pointer-events: none; }
+.nation .tray { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 3px; align-items: center; font-size: 12px; color: var(--muted); }
+.nation .tray:empty { display: none; }
+.tray i { font-style: normal; width: 20px; height: 20px; border-radius: 50%; display: inline-grid; place-items: center; font-family: var(--serif); font-weight: 900; font-size: 11px; line-height: 1; background: var(--piece); border: 1.5px solid var(--c); color: var(--c); }
 details { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; font-size: 13px; }
 summary { cursor: pointer; font-weight: 700; }
 details ul { margin: 8px 0 0; padding-left: 1.2em; display: grid; gap: 4px; }
@@ -154,6 +162,8 @@ details ul { margin: 8px 0 0; padding-left: 1.2em; display: grid; gap: 4px; }
       <button id="undo" type="button">悔棋</button>
       <button id="pause" type="button">暂停 AI</button>
       <button id="newgame" type="button" class="primary">新一局</button>
+      <button id="replay" type="button">回看上一轮</button>
+      <button id="sound" type="button" aria-pressed="true">音效：开</button>
     </div>
     <div class="row">
       <label for="view">视角</label>
@@ -360,7 +370,11 @@ var SG = (function () {
     var res = [];
     for (var p = 0; p < 3; p++) {
       if (!this.alive[p]) continue;
-      for (var q = 0; q < 3; q++) if (q !== p && this.alive[q] && this.gen(q, true).some(function (m) { return m.cap === K && this.own[m.to] === p; }, this)) { res.push({ victim: p, by: q }); break; }
+      for (var q = 0; q < 3; q++) {
+        if (q === p || !this.alive[q]) continue;
+        var hit = this.gen(q, true).filter(function (m) { return m.cap === K && this.own[m.to] === p; }, this)[0];
+        if (hit) { res.push({ victim: p, by: q, from: hit.from, to: hit.to }); break; }
+      }
     }
     return res;
   };
@@ -417,7 +431,7 @@ var SG = (function () {
     return pool[Math.floor(Math.random() * pool.length)][1];
   }
 
-  return { Game: Game, choose: choose, id: id, P_: P_, R_: R_, F_: F_, Lp: Lp, Rp: Rp, NAMES: NAMES, PNAME: PNAME, VAL: VAL, K: K, P: P, EMPTY: EMPTY };
+  return { Game: Game, choose: choose, id: id, P_: P_, R_: R_, F_: F_, Lp: Lp, Rp: Rp, NAMES: NAMES, PNAME: PNAME, VAL: VAL, K: K, P: P, R: R, C: C, H: H, EMPTY: EMPTY, RAYS: RAYS };
 })();
 </script>
 
@@ -504,6 +518,7 @@ var SG = (function () {
     t.textContent = NAMES[p];
     return t;
   });
+  var trailLayer = el('g', {}, rot);
   var marks = el('g', {}, rot);
   var slots = [];
   for (i = 0; i < 135; i++) {
@@ -514,7 +529,9 @@ var SG = (function () {
     var txt = el('text', { class: 'pc-text', x: XY[i][0], y: XY[i][1] + 1 }, pc);
     slots.push({ g: g, pc: pc, body: body, txt: txt });
   }
+  var animLayer = el('g', {}, rot);
   var upright = [zy].concat(nameLabels, slots.map(function (s) { return s.pc; }));
+  var ghostUp = [];   // 动画中的棋子也要保持正立
 
   // ---------- 对局状态 ----------
   // standalone = 页面不是嵌在别的页面里（例如 GitHub Pages）；claude.ai 里不允许点对点直连，只能本地对弈
@@ -526,6 +543,11 @@ var SG = (function () {
   var game, hist, moves, lastCap, over, sel, targets, paused = false, aiToken = 0, thinking = false, angle = 0, log = [];
   var net = null;   // 联机时的房间状态
   var lastBottom = 2;
+  // 动画：pendingAnim 等下一次重画时开始播放；animQ 是排队依次播放的走法（回看、联机补帧）
+  var pendingAnim = null, animActive = false, animBusyUntil = 0, animHide = -1, animRaf = 0, animQ = [], qTimer = 0, replaying = false;
+  var reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  function inputBusy() { return animQ.length > 0 || replaying; }
+  function committedMoves() { return moves.concat(animQ); }
 
   // ---- 座位：本地和联机两种模式共用的判断 ----
   function aiLevel(p) {
@@ -542,9 +564,10 @@ var SG = (function () {
   function resetTo(f, replay) {
     first = f; game = new SG.Game(first); hist = []; moves = []; lastCap = 0; over = null; sel = -1; targets = []; log = [];
     aiToken++; thinking = false;
+    stopAnim();
     (replay || []).forEach(function (mv) {
       var m = legal(mv[0], mv[1]);
-      if (m) applyMove(m, true);
+      if (m) applyMove(m, true, false);
     });
   }
   function newGame(f, replay) {
@@ -559,9 +582,18 @@ var SG = (function () {
   }
   function legal(from, to) { return game.gen(game.turn).filter(function (x) { return x.from === from && x.to === to; })[0]; }
   function cell(i) { return NAMES[P_(i)] + F_(i) + '路' + (R_(i) + 1) + '线'; }
-  function applyMove(m, quiet) {
-    var pieceType = game.type[m.from], victim = game.own[m.to];
-    var entry = { mover: m.mover, text: NAMES[m.mover] + SG.PNAME[pieceType] + ' ' + cell(m.from) + ' → ' + cell(m.to), cls: '' };
+  // 棋子实际经过的点：车、炮、飞将沿直线逐点走（可能在中原拐弯），其他棋子直接跳
+  function movePath(from, to, ptype) {
+    if (ptype === SG.R || ptype === SG.C || ptype === SG.K) {
+      var rays = SG.RAYS[from];
+      for (var k = 0; k < rays.length; k++) { var ix = rays[k].indexOf(to); if (ix >= 0) return [from].concat(rays[k].slice(0, ix + 1)); }
+    }
+    return [from, to];
+  }
+  function applyMove(m, quiet, anim) {
+    var pieceType = game.type[m.from], victim = game.own[m.to], path = movePath(m.from, m.to, pieceType);
+    var entry = { mover: m.mover, text: NAMES[m.mover] + SG.PNAME[pieceType] + ' ' + cell(m.from) + ' → ' + cell(m.to), cls: '', path: path, cap: m.cap, victim: victim };
+    if (anim !== false) pendingAnim = { path: path, ptype: pieceType, owner: m.mover, cap: m.cap, capOwner: victim, to: m.to };
     if (m.cap) {
       entry.text += '，吃' + NAMES[victim] + (m.cap === SG.K ? '帅' : SG.PNAME[m.cap]);
       entry.cls = m.cap === SG.K ? 'elim' : 'cap';
@@ -589,7 +621,7 @@ var SG = (function () {
     while (!game.gen(game.turn).length && guard++ < 3) game.turn = game.nextAlive(game.turn);
   }
   function undo() {
-    if (!hist.length || (net && net.role !== 'host')) return;
+    if (!hist.length || (net && net.role !== 'host') || inputBusy()) return;
     aiToken++; thinking = false;
     var popOne = function () { var h = hist.pop(); game.unmake(h.u); lastCap = h.lastCap; moves.pop(); log.pop(); };
     popOne();
@@ -608,12 +640,13 @@ var SG = (function () {
     worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
   } catch (err) { worker = null; }
   function schedule() {
-    if (over || paused || thinking || !runsAI()) return;
+    if (over || paused || thinking || !runsAI() || inputBusy()) return;
     var me = game.turn, lvl = aiLevel(me);
     if (!lvl) return;
     thinking = true; render();
     var token = ++aiToken, cfg = AI[lvl], t0 = Date.now();
-    var go = function (m) { var wait = Math.max(0, 450 - (Date.now() - t0)); setTimeout(function () { onAiMove(token, m); }, wait); };
+    // 至少等上一步的动画播完再落子，让人看清每一步
+    var go = function (m) { var wait = Math.max(0, 450 - (Date.now() - t0), animBusyUntil - Date.now() + 300); setTimeout(function () { onAiMove(token, m); }, wait); };
     if (worker) { worker.onmessage = function (e) { if (e.data.token === token) go(e.data.m); }; worker.postMessage({ token: token, state: game.toState(), me: me, depth: cfg[0], margin: cfg[1] }); }
     else setTimeout(function () { go(SG.choose(SG.Game.fromState(game.toState()), me, cfg[0], cfg[1])); }, 30);
   }
@@ -627,10 +660,10 @@ var SG = (function () {
 
   // ---------- 交互 ----------
   function onSlot(i) {
-    if (thinking || !myTurn()) return;
+    if (thinking || inputBusy() || !myTurn()) return;
     var t = targets.filter(function (m) { return m.to === i; })[0];
     if (t) {
-      if (net && net.role === 'guest') { netSend({ type: 'move', from: t.from, to: t.to, rev: net.rev }); applyMove(t, true); sel = -1; targets = []; render(); return; }
+      if (net && net.role === 'guest') { netSend({ type: 'move', from: t.from, to: t.to, rev: net.rev }); applyMove(t, true); sel = -1; targets = []; render(); saveRoom(); return; }
       applyMove(t); return;
     }
     if (game.own[i] === game.turn) { sel = i; targets = game.gen(game.turn).filter(function (m) { return m.from === i; }); }
@@ -658,14 +691,17 @@ var SG = (function () {
     return LEVELS[s.lvl];
   }
   function render() {
-    // 视角：联机时自己的国家在下方
+    if (pendingAnim) { var pa = pendingAnim; pendingAnim = null; startAnim(pa); }
+    // 视角：联机时自己的国家在下方；动画播放时先不转，播完再转
     var bottom;
     if (view !== 'follow') bottom = +view;
     else if (net && net.mySeat >= 0) bottom = net.mySeat;
     else bottom = isPerson(game.turn) ? game.turn : lastBottom;
+    if (animActive) bottom = lastBottom;
     lastBottom = bottom;
     var target = 90 - BASE_ANGLE[bottom], diff = ((target - angle) % 360 + 540) % 360 - 180;
     angle += diff;
+    ghostUp.forEach(function (n) { n.style.transform = 'rotate(' + (-angle) + 'deg)'; });
     rot.style.transform = 'rotate(' + angle + 'deg)';
     upright.forEach(function (n) { n.style.transform = 'rotate(' + (-angle) + 'deg)'; });
     riverLabels.forEach(function (rl) {
@@ -686,12 +722,25 @@ var SG = (function () {
 
     var lastMv = moves.length ? moves[moves.length - 1] : null;
     var threats = over ? [] : game.threatened();
-    var danger = {}; threats.forEach(function (t) { for (var i = 0; i < 135; i++) if (game.type[i] === SG.K && game.own[i] === t.victim) danger[i] = t.by; });
+    var danger = {}; threats.forEach(function (t) { danger[t.to] = t.by; });
     marks.textContent = '';
-    if (lastMv) el('circle', { class: 'last', cx: XY[lastMv[0]][0], cy: XY[lastMv[0]][1], r: 8 }, marks);
+    // 这一轮三家各自的走法轨迹：用走棋一方的颜色，越早的越淡
+    trailLayer.textContent = '';
+    var nTrail = Math.min(log.length, 3);
+    for (var q = nTrail - 1; q >= 0; q--) {
+      var en = log[log.length - 1 - q];
+      if (!en.path) continue;
+      var op = [0.62, 0.38, 0.22][q];
+      el('polyline', { class: 'trail', points: poly(en.path.map(function (i) { return XY[i]; })), stroke: COLORS[en.mover], 'stroke-width': 7, opacity: op }, trailLayer);
+      var f0 = XY[en.path[0]];
+      el('circle', { cx: f0[0], cy: f0[1], r: 10, fill: 'var(--piece)', stroke: COLORS[en.mover], 'stroke-width': 3, opacity: Math.min(1, op + 0.25) }, trailLayer);
+    }
+    threats.forEach(function (t) {
+      el('polyline', { class: 'threat', points: poly(movePath(t.from, t.to, game.type[t.from]).map(function (i) { return XY[i]; })) }, marks);
+    });
     for (var i = 0; i < 135; i++) {
       var s = slots[i], t = game.type[i];
-      s.pc.style.display = t ? '' : 'none';
+      s.pc.style.display = t && i !== animHide ? '' : 'none';
       if (t) {
         var o = game.own[i];
         s.body.setAttribute('stroke', COLORS[o]);
@@ -702,7 +751,7 @@ var SG = (function () {
       }
       s.g.setAttribute('aria-label', cell(i) + (t ? '：' + NAMES[game.own[i]] + SG.PNAME[t] : '：空'));
     }
-    if (lastMv) el('circle', { class: 'last', cx: XY[lastMv[1]][0], cy: XY[lastMv[1]][1], r: 25 }, marks);
+    if (lastMv && log.length) el('circle', { class: 'last', cx: XY[lastMv[1]][0], cy: XY[lastMv[1]][1], r: 25, style: 'stroke:' + COLORS[log[log.length - 1].mover] }, marks);
     Object.keys(danger).forEach(function (i) { el('circle', { class: 'danger', cx: XY[i][0], cy: XY[i][1], r: 28 }, marks); });
     if (sel >= 0) el('circle', { class: 'sel', cx: XY[sel][0], cy: XY[sel][1], r: 25 }, marks);
     targets.forEach(function (m) {
@@ -710,6 +759,7 @@ var SG = (function () {
       else el('circle', { class: 'dot', cx: XY[m.to][0], cy: XY[m.to][1], r: 7 }, marks);
     });
     rot.appendChild(marks); // 标记盖在棋子上方，但不拦截点击
+    rot.appendChild(animLayer);
     marks.style.pointerEvents = 'none';
 
     // 状态行
@@ -758,8 +808,11 @@ var SG = (function () {
         opts = opts.concat([['easy', LEVELS.easy], ['normal', LEVELS.normal], ['hard', LEVELS.hard]]);
         ctl = '<select id="seat' + p + '" aria-label="' + NAMES[p] + '由谁来下">' + opts.map(function (o) { return '<option value="' + o[0] + '"' + (cur === o[0] ? ' selected' : '') + '>' + o[1] + '</option>'; }).join('') + '</select>';
       } else ctl = '<div class="who">' + seatLabel(p) + '</div>';
+      var tray = log.filter(function (e) { return e.mover === p && e.cap; }).map(function (e) {
+        return '<i style="--c:' + COLORS[e.victim] + '">' + (e.cap === SG.K ? NAMES[e.victim] : SG.PNAME[e.cap]) + '</i>';
+      }).join('');
       d.innerHTML = '<div class="seal">' + NAMES[p] + '</div><div class="meta"><div class="nm">' + NAMES[p] + '国</div><div class="st">' + stTxt + '</div>' + ctl + '</div>' +
-        '<div class="nums"><b>' + fmt(game.score[p]) + '</b>吃子分</div>';
+        '<div class="nums"><b>' + fmt(game.score[p]) + '</b>吃子分</div>' + '<div class="tray" aria-label="' + NAMES[p] + '吃掉的棋子">' + tray + '</div>';
       box.appendChild(d);
       var selEl = d.querySelector('select');
       if (selEl) selEl.onchange = function (e) { changeSeat(p, e.target.value); };
@@ -772,7 +825,11 @@ var SG = (function () {
     $('pause').hidden = !ctrlHost;
     $('undo').hidden = !ctrlHost;
     $('newgame').hidden = !ctrlHost;
-    $('undo').disabled = !hist.length;
+    $('undo').disabled = !hist.length || inputBusy();
+    $('replay').disabled = !myTurn() || inputBusy() || !moves.length;
+    $('replay').textContent = replaying ? '回看中…' : '回看上一轮';
+    $('sound').textContent = '音效：' + (soundOn ? '开' : '关');
+    $('sound').setAttribute('aria-pressed', soundOn ? 'true' : 'false');
     // 棋谱
     var ol = $('log');
     ol.innerHTML = '';
@@ -790,14 +847,139 @@ var SG = (function () {
   }
   function fmt(x) { return (Math.round(x * 10) / 10).toString(); }
 
+  // ---------- 走子动画 ----------
+  function makeGhost(at, glyph, owner, isKing) {
+    var g = el('g', { class: 'ghost' }, animLayer);
+    if (at != null) g.setAttribute('transform', 'translate(' + XY[at][0] + ' ' + XY[at][1] + ')');
+    var up = el('g', { class: isKing ? 'pc-king' : '' }, g);
+    up.style.transformBox = 'fill-box'; up.style.transformOrigin = 'center'; up.style.transform = 'rotate(' + (-angle) + 'deg)';
+    var body = el('g', {}, up);
+    el('circle', { class: 'pc-body', cx: 0, cy: 0, r: isKing ? 22 : 19, fill: 'var(--piece)', stroke: COLORS[owner] }, body);
+    var t = el('text', { class: 'pc-text', x: 0, y: 1, fill: COLORS[owner] }, body); t.textContent = glyph;
+    ghostUp.push(up);
+    return { g: g, body: body, up: up };
+  }
+  function dropGhost(gh) { if (!gh) return; gh.g.remove(); ghostUp = ghostUp.filter(function (n) { return n !== gh.up; }); }
+  function stopAnim() {
+    cancelAnimationFrame(animRaf); animLayer.textContent = ''; ghostUp = [];
+    animActive = false; animHide = -1; pendingAnim = null; animBusyUntil = 0;
+  }
+  function glyphOf(ptype, owner) { return ptype === SG.K ? NAMES[owner] : SG.PNAME[ptype]; }
+  function startAnim(a) {
+    cancelAnimationFrame(animRaf); animLayer.textContent = ''; ghostUp = [];
+    var pts = a.path.map(function (i) { return XY[i]; }), L = [0];
+    for (var k = 1; k < pts.length; k++) L.push(L[k - 1] + Math.hypot(pts[k][0] - pts[k - 1][0], pts[k][1] - pts[k - 1][1]));
+    var total = L[L.length - 1];
+    var dur = reduceMotion ? 0 : Math.min(800, Math.max(300, 220 + total * 0.9));
+    var capG = a.cap ? makeGhost(a.to, glyphOf(a.cap, a.capOwner), a.capOwner, a.cap === SG.K) : null;
+    var mv = makeGhost(null, glyphOf(a.ptype, a.owner), a.owner, a.ptype === SG.K);
+    mv.g.setAttribute('class', 'ghost moving');
+    animHide = a.to; animActive = true;
+    animBusyUntil = Date.now() + dur + (a.cap && !reduceMotion ? 320 : 0);
+    var t0 = performance.now();
+    function place(e) {
+      var d = e * total, k = 1;
+      while (k < L.length - 1 && L[k] < d) k++;
+      var seg = (L[k] - L[k - 1]) || 1, u = Math.max(0, Math.min(1, (d - L[k - 1]) / seg));
+      var x = pts[k - 1][0] + (pts[k][0] - pts[k - 1][0]) * u, y = pts[k - 1][1] + (pts[k][1] - pts[k - 1][1]) * u;
+      var lift = Math.sin(Math.PI * e) * (a.ptype === SG.H || a.ptype === 3 ? 0.22 : 0.1); // 马、象"跳"得更高
+      mv.g.setAttribute('transform', 'translate(' + x.toFixed(1) + ' ' + y.toFixed(1) + ') scale(' + (1 + lift).toFixed(3) + ')');
+    }
+    function frame(now) {
+      var t = dur ? Math.min(1, (now - t0) / dur) : 1;
+      place(t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+      if (t < 1) { animRaf = requestAnimationFrame(frame); return; }
+      land();
+    }
+    function land() {
+      sound(a.cap ? 'cap' : 'move');
+      dropGhost(mv);
+      animHide = -1; animActive = false;
+      if (capG && !reduceMotion) {
+        // 被吃的子被撞飞：放大、变淡，外面扩散一圈红色
+        animLayer.appendChild(capG.g);
+        var ring = el('circle', { class: 'burst', cx: XY[a.to][0], cy: XY[a.to][1], r: 20 }, animLayer);
+        var b0 = performance.now();
+        var burst = function (now) {
+          var t = Math.min(1, (now - b0) / 320);
+          capG.body.setAttribute('transform', 'scale(' + (1 + 0.6 * t).toFixed(3) + ')');
+          capG.g.style.opacity = String(1 - t);
+          ring.setAttribute('r', (20 + 26 * t).toFixed(1)); ring.style.opacity = String(1 - t);
+          if (t < 1) animRaf = requestAnimationFrame(burst); else { dropGhost(capG); ring.remove(); }
+        };
+        animRaf = requestAnimationFrame(burst);
+      } else dropGhost(capG);
+      render();
+    }
+    if (dur) { place(0); animRaf = requestAnimationFrame(frame); } else land();
+  }
+
+  // ---- 依次播放一串走法（回看上一轮、联机时别人连走的几步）----
+  function enqueue(list) { animQ = animQ.concat(list); if (!qTimer) runQueue(); }
+  function runQueue() {
+    qTimer = 0;
+    if (!animQ.length) {
+      replaying = false;
+      if (net && net.role === 'guest') saveRoom();
+      render(); schedule(); return;
+    }
+    var wait = Math.max(0, animBusyUntil - Date.now() + 150);
+    if (wait > 0) { qTimer = setTimeout(runQueue, wait); return; }
+    var mv = animQ.shift(), m = legal(mv[0], mv[1]);
+    if (!m) { animQ = []; replaying = false; render(); return; }
+    applyMove(m, true); render();
+    qTimer = setTimeout(runQueue, Math.max(0, animBusyUntil - Date.now()) + 150);
+  }
+  function replayLast() {
+    if (!myTurn() || inputBusy() || !moves.length) return;
+    var all = committedMoves(), k = Math.min(all.length, game.aliveCount());
+    resetTo(first, all.slice(0, all.length - k));
+    replaying = true; render();
+    enqueue(all.slice(all.length - k));
+  }
+  $('replay').onclick = replayLast;
+
+  // ---- 音效：用 Web Audio 合成木头落子声，不需要音频文件 ----
+  var soundOn = (function () { try { return localStorage.getItem('sgxq-sound') !== 'off'; } catch (e) { return true; } })();
+  var actx = null;
+  function audio() {
+    if (!actx) { var AC = window.AudioContext || window.webkitAudioContext; if (!AC) return null; actx = new AC(); }
+    if (actx.state === 'suspended') actx.resume();
+    return actx;
+  }
+  function sound(kind) {
+    if (!soundOn) return;
+    try {
+      var ac = audio(); if (!ac) return;
+      var t = ac.currentTime, cap = kind === 'cap';
+      var o = ac.createOscillator(), g = ac.createGain();
+      o.type = 'triangle';
+      o.frequency.setValueAtTime(cap ? 190 : 420, t); o.frequency.exponentialRampToValueAtTime(cap ? 70 : 210, t + (cap ? 0.22 : 0.09));
+      g.gain.setValueAtTime(cap ? 0.45 : 0.28, t); g.gain.exponentialRampToValueAtTime(0.001, t + (cap ? 0.3 : 0.12));
+      o.connect(g); g.connect(ac.destination); o.start(t); o.stop(t + 0.35);
+      var len = Math.floor(ac.sampleRate * 0.03), buf = ac.createBuffer(1, len, ac.sampleRate), ch = buf.getChannelData(0);
+      for (var i = 0; i < len; i++) ch[i] = (Math.random() * 2 - 1) * (1 - i / len);
+      var n = ac.createBufferSource(), bp = ac.createBiquadFilter(), ng = ac.createGain();
+      n.buffer = buf; bp.type = 'bandpass'; bp.frequency.value = cap ? 900 : 2200; ng.gain.value = cap ? 0.5 : 0.3;
+      n.connect(bp); bp.connect(ng); ng.connect(ac.destination); n.start(t);
+    } catch (e) {}
+  }
+  document.addEventListener('pointerdown', function () { if (soundOn) { try { audio(); } catch (e) {} } }, { once: true });
+  $('sound').onclick = function () {
+    soundOn = !soundOn;
+    try { localStorage.setItem('sgxq-sound', soundOn ? 'on' : 'off'); } catch (e) {}
+    if (soundOn) sound('move');
+    render();
+  };
+
   // ---------- 保存（仅本机浏览器）----------
   function persist() { if (!net) save(); else if (net.role === 'host') saveRoom(); }
-  function save() { try { localStorage.setItem('sgxq', JSON.stringify({ seats: seats, first: first, view: view, moves: moves })); } catch (e) {} }
+  function save() { try { localStorage.setItem('sgxq', JSON.stringify({ seats: seats, first: first, view: view, moves: committedMoves() })); } catch (e) {} }
   function load() { try { return JSON.parse(localStorage.getItem('sgxq') || 'null'); } catch (e) { return null; } }
   function saveRoom() {
     try {
       localStorage.setItem('sgxq-room', JSON.stringify(net ? { role: net.role, code: net.code, mySeat: net.mySeat, t: Date.now(),
-        seats: net.role === 'host' ? net.seats : null, first: first, moves: moves, rev: net.rev } : null));
+        seats: net.role === 'host' ? net.seats : null, first: first, moves: committedMoves(), rev: net.rev } : null));
     } catch (e) {}
   }
   function loadRoom() {
@@ -838,7 +1020,7 @@ var SG = (function () {
   function publicSeats() { return net.seats.map(function (s, p) { return { kind: s.kind, lvl: s.lvl, connected: s.kind === 'guest' ? isOnline(s.cid) : undefined }; }); }
   function isOnline(c) { return net.conns.some(function (e) { return e.cid === c && e.c.open; }); }
   function seatOfCid(c) { for (var p = 0; p < 3; p++) if (net.seats[p].kind === 'guest' && net.seats[p].cid === c) return p; return -1; }
-  function stateMsg(entry) { return { type: 'state', rev: net.rev, first: first, moves: moves, seats: publicSeats(), you: seatOfCid(entry.cid), paused: paused }; }
+  function stateMsg(entry) { return { type: 'state', rev: net.rev, first: first, moves: committedMoves(), seats: publicSeats(), you: seatOfCid(entry.cid), paused: paused }; }
   function sendTo(entry, msg) { try { if (entry.c.open) entry.c.send(msg); } catch (e) {} }
   function broadcast() { net.conns.forEach(function (e) { if (e.cid) sendTo(e, stateMsg(e)); }); refreshHostSeats(); }
   function refreshHostSeats() { net.seats.forEach(function (s) { if (s.kind === 'guest') s.connected = isOnline(s.cid); }); }
@@ -902,7 +1084,7 @@ var SG = (function () {
     }
     if (msg.type === 'move') {
       var seat = seatOfCid(entry.cid);
-      var m = !over && seat === game.turn ? legal(msg.from, msg.to) : null;
+      var m = !over && !inputBusy() && seat === game.turn ? legal(msg.from, msg.to) : null;
       if (!m) { net.rev++; sendTo(entry, stateMsg(entry)); return; }
       applyMove(m);
       return;
@@ -956,9 +1138,10 @@ var SG = (function () {
       net.last = Date.now();
       if (msg.type === 'state' && msg.rev >= net.rev) {
         net.rev = msg.rev; net.seats = msg.seats; net.mySeat = msg.you; paused = !!msg.paused;
-        var s0 = sel, t0 = targets;
-        resetTo(msg.first, msg.moves);
-        if (myTurn() && s0 >= 0 && game.own[s0] === game.turn) { sel = s0; targets = t0; }
+        var local = committedMoves(), inc = msg.moves || [];
+        var prefix = msg.first === first && local.length <= inc.length && local.every(function (mv, k) { return inc[k][0] === mv[0] && inc[k][1] === mv[1]; });
+        if (prefix && inc.length > local.length) enqueue(inc.slice(local.length));      // 别人新走的棋：逐步播放
+        else if (!prefix || inc.length !== local.length) { animQ = []; clearTimeout(qTimer); qTimer = 0; replaying = false; resetTo(msg.first, inc); }
         saveRoom(); render();
       }
       if (msg.type === 'ping') netSend({ type: 'pong' });
@@ -1038,7 +1221,7 @@ var SG = (function () {
   };
 
   // ---------- 启动 ----------
-  window.claude && window.claude.hot && window.claude.hot.snapshot && window.claude.hot.snapshot(function () { return { seats: seats, first: first, view: view, moves: moves }; });
+  window.claude && window.claude.hot && window.claude.hot.snapshot && window.claude.hot.snapshot(function () { return { seats: seats, first: first, view: view, moves: committedMoves() }; });
   function start(data) {
     var d = data && data.moves ? data : saved;
     if (d && d.seats) seats = d.seats;
