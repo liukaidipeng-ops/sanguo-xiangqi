@@ -139,6 +139,9 @@ button:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px
 .belt { fill: none; stroke: var(--piece); stroke-width: 15; stroke-linecap: round; stroke-linejoin: round; opacity: .5; }
 .chev { fill: none; stroke: var(--target); stroke-width: 2.6; stroke-linecap: round; stroke-linejoin: round; }
 .ahead { fill: var(--target); opacity: .8; }
+/* 查看别家棋子（或没轮到你时）的走法：通道换成这枚棋子所属国家的颜色 */
+.guide.peek .belt { stroke: var(--pc); opacity: .55; }
+.sel.peek { stroke-dasharray: 2 4; stroke-width: 3.5; }
 .ghost.moving { filter: drop-shadow(0 6px 5px rgba(0, 0, 0, .35)); }
 .burst { fill: none; stroke: var(--danger); stroke-width: 4; pointer-events: none; }
 .nation .tray { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 3px; align-items: center; font-size: 12px; color: var(--muted); }
@@ -553,6 +556,7 @@ var SG = (function () {
   var pendingAnim = null, animActive = false, animBusyUntil = 0, animHide = -1, animRaf = 0, animQ = [], qTimer = 0, replaying = false;
   var reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   var guideKey = '', guideBelts = [], guideRaf = 0;
+  var peek = -1, peekOwner = -1, peekTargets = [];   // 只看不走：任何时候点别家的子（或没轮到你时点任意子）显示它的走法
   function inputBusy() { return animQ.length > 0 || replaying; }
   function committedMoves() { return moves.concat(animQ); }
 
@@ -569,7 +573,7 @@ var SG = (function () {
   function runsAI() { return !net || net.role === 'host'; }
 
   function resetTo(f, replay) {
-    first = f; game = new SG.Game(first); hist = []; moves = []; lastCap = 0; over = null; sel = -1; targets = []; log = [];
+    first = f; game = new SG.Game(first); hist = []; moves = []; lastCap = 0; over = null; sel = -1; targets = []; log = []; peek = -1;
     aiToken++; thinking = false;
     stopAnim();
     (replay || []).forEach(function (mv) {
@@ -667,14 +671,17 @@ var SG = (function () {
 
   // ---------- 交互 ----------
   function onSlot(i) {
-    if (thinking || inputBusy() || !myTurn()) return;
-    var t = targets.filter(function (m) { return m.to === i; })[0];
+    var canAct = !thinking && !inputBusy() && myTurn();
+    var t = canAct && targets.filter(function (m) { return m.to === i; })[0];
     if (t) {
+      peek = -1;
       if (net && net.role === 'guest') { netSend({ type: 'move', from: t.from, to: t.to, rev: net.rev }); applyMove(t, true); sel = -1; targets = []; render(); saveRoom(); return; }
       applyMove(t); return;
     }
-    if (game.own[i] === game.turn) { sel = i; targets = game.gen(game.turn).filter(function (m) { return m.from === i; }); }
-    else { sel = -1; targets = []; }
+    sel = -1; targets = [];
+    if (canAct && game.own[i] === game.turn) { peek = -1; sel = i; targets = game.gen(game.turn).filter(function (m) { return m.from === i; }); }
+    else if (game.type[i] && i !== peek) { peek = i; peekOwner = game.own[i]; }   // 只看不走
+    else peek = -1;
     render();
   }
   svg.addEventListener('click', function (e) { var s = e.target.closest('.slot'); if (s) onSlot(+s.getAttribute('data-i')); });
@@ -699,6 +706,8 @@ var SG = (function () {
   }
   function render() {
     if (pendingAnim) { var pa = pendingAnim; pendingAnim = null; startAnim(pa); }
+    if (peek >= 0 && (game.own[peek] !== peekOwner || !game.type[peek])) peek = -1;   // 棋子被吃或走开了
+    peekTargets = peek >= 0 ? game.gen(peekOwner).filter(function (m) { return m.from === peek; }) : [];
     // 视角：联机时自己的国家在下方；动画播放时先不转，播完再转
     var bottom;
     if (view !== 'follow') bottom = +view;
@@ -733,7 +742,7 @@ var SG = (function () {
     marks.textContent = '';
     // 这一轮三家各自的走法轨迹：用走棋一方的颜色，越早的越淡
     trailLayer.textContent = '';
-    trailLayer.style.opacity = sel >= 0 ? .3 : '';
+    trailLayer.style.opacity = sel >= 0 || peek >= 0 ? .3 : '';
     var nTrail = Math.min(log.length, 3);
     for (var q = nTrail - 1; q >= 0; q--) {
       var en = log[log.length - 1 - q];
@@ -762,8 +771,10 @@ var SG = (function () {
     if (lastMv && log.length) el('circle', { class: 'last', cx: XY[lastMv[1]][0], cy: XY[lastMv[1]][1], r: 25, style: 'stroke:' + COLORS[log[log.length - 1].mover] }, marks);
     Object.keys(danger).forEach(function (i) { el('circle', { class: 'danger', cx: XY[i][0], cy: XY[i][1], r: 28 }, marks); });
     if (sel >= 0) el('circle', { class: 'sel', cx: XY[sel][0], cy: XY[sel][1], r: 25 }, marks);
+    if (peek >= 0) el('circle', { class: 'sel peek', cx: XY[peek][0], cy: XY[peek][1], r: 25, style: 'stroke:' + COLORS[peekOwner] }, marks);
+    var shown = sel >= 0 ? targets : peekTargets;
     var ends = drawGuide();
-    targets.forEach(function (m) {
+    shown.forEach(function (m) {
       if (m.cap) {
         el('circle', { class: 'capring', cx: XY[m.to][0], cy: XY[m.to][1], r: 24 }, marks);
         if (ends[m.to] && ends[m.to].len > 53) arrowHead(ends[m.to], ends[m.to].len - 31, marks);   // 吃子：箭头顶到圈上（贴身吃子只画圈）
@@ -785,10 +796,13 @@ var SG = (function () {
         var sk = net.seats[game.turn].kind;
         line = sk === 'open' ? '等人加入执' + who : sk === 'host' ? '等房主（' + who + '）走棋' : '等 ' + who + ' 走棋' + (net.seats[game.turn].connected ? '' : '（掉线了）');
       } else line = '轮到 ' + who + ' 走棋';
-      var sub = threats.length ? threats.map(function (t) { return NAMES[t.victim] + '的帅正被' + NAMES[t.by] + '威胁'; }).join('；')
-        : (mine ? (sel >= 0 ? '点选黑点落子，圆圈表示可以吃子' : '先点选一枚己方棋子') : (net && net.mySeat < 0 ? '你在观战' : ''));
+      var sub = peek >= 0 ? peekText()
+        : threats.length ? threats.map(function (t) { return NAMES[t.victim] + '的帅正被' + NAMES[t.by] + '威胁'; }).join('；')
+        : (mine ? (sel >= 0 ? '点选黑点落子，圆圈表示可以吃子' : '先点选一枚己方棋子；点别家的子可以看它怎么走')
+          : (net && net.mySeat < 0 ? '你在观战，' : '') + '点任意棋子可以看它怎么走');
       st.innerHTML = line + '<small>' + (sub || '&nbsp;') + '</small>';
     }
+    if (over && peek >= 0) st.innerHTML = '对局结束<small>' + peekText() + '</small>';
     st.className = 'status' + (mine ? ' mine' : '');
     st.style.setProperty('--c', COLORS[game.turn]);
     // 结果卡
@@ -859,6 +873,11 @@ var SG = (function () {
   function fmt(x) { return (Math.round(x * 10) / 10).toString(); }
 
   // ---------- 走子动画 ----------
+  function peekText() {
+    var nm = NAMES[peekOwner] + (game.type[peek] === SG.K ? '帅' : SG.PNAME[game.type[peek]]);
+    var caps = peekTargets.filter(function (m) { return m.cap; }).map(function (m) { return NAMES[game.own[m.to]] + (m.cap === SG.K ? '帅' : SG.PNAME[m.cap]); });
+    return '查看' + nm + '：' + (peekTargets.length ? '能走 ' + peekTargets.length + ' 处' + (caps.length ? '，能吃' + caps.join('、') : '，没有能吃的子') : '现在走不动') + '。再点一下关闭';
+  }
   // ---------- 走法指引：选中棋子后，每个可走方向一条流动的箭头带 ----------
   // 车、炮、帅沿实际路线（可能在中原拐弯），同一方向只画最远的一条；马、象、仕、兵直接连起点和落点
   function beltOf(path) {
@@ -877,18 +896,21 @@ var SG = (function () {
   }
   var CHEV_GAP = 22, CHEV_SPEED = 34;
   function drawGuide() {
-    var key = sel >= 0 ? sel + ':' + targets.map(function (m) { return m.to; }).join(',') : '';
+    var from = sel >= 0 ? sel : peek, list = sel >= 0 ? targets : peekTargets;
+    var key = from >= 0 ? (sel >= 0 ? 's' : 'p') + from + ':' + list.map(function (m) { return m.to + (m.cap ? 'x' : ''); }).join(',') : '';
     var ends = {};
     if (key !== guideKey) {
       guideKey = key; guideLayer.textContent = ''; guideBelts = [];
       cancelAnimationFrame(guideRaf); guideRaf = 0;
-      if (sel >= 0 && targets.length) {
-        var ptype = game.type[sel];
-        var paths = targets.map(function (m) { return movePath(sel, m.to, ptype); });
+      guideLayer.setAttribute('class', 'guide' + (sel < 0 && peek >= 0 ? ' peek' : ''));
+      if (peek >= 0) guideLayer.style.setProperty('--pc', COLORS[peekOwner]);
+      if (from >= 0 && list.length) {
+        var targets_ = list, ptype = game.type[from];
+        var paths = targets_.map(function (m) { return movePath(from, m.to, ptype); });
         var isPrefix = function (a, b) { if (a.length >= b.length) return false; for (var k = 0; k < a.length; k++) if (a[k] !== b[k]) return false; return true; };
         paths.forEach(function (pa, n) {
           if (paths.some(function (pb) { return isPrefix(pa, pb); })) return;   // 被更长的同向路线覆盖
-          var b = beltOf(pa); b.to = targets[n].to; b.cap = targets[n].cap;
+          var b = beltOf(pa); b.to = targets_[n].to; b.cap = targets_[n].cap;
           el('polyline', { class: 'belt', points: poly(b.pts) }, guideLayer);
           guideBelts.push(b);
         });
